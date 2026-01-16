@@ -1,2 +1,6 @@
-aiogram>=3.4.1
+aiogram==3.*
 aiohttp
+matplotlib
+requests
+numpy
+pandas
