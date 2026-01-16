@@ -1,4 +1,4 @@
-# bot_aiogram.py
+# bot_aiogram.py (полная исправленная версия)
 import asyncio
 import logging
 import html
@@ -6,13 +6,12 @@ import os
 import random
 import io
 import time
+from datetime import datetime
 
 import aiohttp
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-
-
 
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message, BufferedInputFile
@@ -20,34 +19,47 @@ from aiogram.filters import Command
 from aiogram import types
 
 import json
-import os
 
 DATA_FILE = "data.json"
 
 def load_data():
     if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            logging.exception("Failed to load data.json, returning defaults")
     return {"USER_NICKS": {}, "STALK_LIST_CF": {}, "STALK_LIST_AC": {}}
 
-def save_data(data):
+def save_data_raw(data):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-# Загрузка данных при старте
-data = load_data()
-USER_NICKS = data["USER_NICKS"]
-STALK_LIST_CF = data["STALK_LIST_CF"]
-STALK_LIST_AC = data["STALK_LIST_AC"]
+# --- Загрузка данных при старте (нормализуем ключи в строки) ---
+_raw = load_data()
+USER_NICKS = {str(k): v for k, v in _raw.get("USER_NICKS", {}).items()}
+STALK_LIST_CF = {str(k): v for k, v in _raw.get("STALK_LIST_CF", {}).items()}
+STALK_LIST_AC = {str(k): v for k, v in _raw.get("STALK_LIST_AC", {}).items()}
 
-
-
-
+def save_all():
+    try:
+        save_data_raw({
+            "USER_NICKS": USER_NICKS,
+            "STALK_LIST_CF": STALK_LIST_CF,
+            "STALK_LIST_AC": STALK_LIST_AC
+        })
+    except Exception:
+        logging.exception("Failed to save data")
 
 # ---------- Конфигурация ----------
 logging.basicConfig(level=logging.INFO)
 REQUEST_TIMEOUT = 10
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "7968511826:AAEs2YFFTeK2p5DMylIkiR602aURFFys-vw")
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    logging.error("BOT_TOKEN not set in environment. Please set BOT_TOKEN.")
+    raise RuntimeError("BOT_TOKEN not set")
+
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
@@ -66,18 +78,12 @@ async def close_global_session():
         GLOBAL_SESSION = None
         logging.info("Global aiohttp session closed")
 
-# ---------- Списки слежки ----------
-STALK_LIST_CF = {}
-STALK_LIST_AC = {}
-
+# ---------- Состояние слежки и прочее ----------
 stalking_active_cf = True
 stalking_active_ac = True
 
 last_solved_cf = {}
 last_solved_ac = {}
-
-# ---------- Хранилище ников ----------
-USER_NICKS = {}  # user_id -> {"cf": nick, "ac": nick}
 
 # ---------- Утилиты ----------
 def esc(s):
@@ -101,18 +107,58 @@ async def safe_get_json(url, params=None, retries=3, delay=1):
                 logging.exception(f"HTTP/JSON final failure for {url}: {e}")
                 return None
 
+# --- Helpers для работы с сохранёнными никами и списками слежки ---
+def get_stored_nick_raw(key):
+    # key is user id (int or str)
+    return USER_NICKS.get(str(key))
+
 def get_stored_nick(user_id, platform):
-    data = USER_NICKS.get(user_id)
+    data = get_stored_nick_raw(user_id)
     if not data:
         return None
     return data.get(platform)
 
+def set_user_nick(user_id, platform, nick):
+    k = str(user_id)
+    USER_NICKS.setdefault(k, {"cf": None, "ac": None})
+    if platform in ("cf", "ac"):
+        USER_NICKS[k][platform] = nick
+    else:
+        USER_NICKS[k]["cf"] = nick
+        USER_NICKS[k]["ac"] = nick
+    save_all()
+
+def add_stalk(chat_id, platform, handle):
+    k = str(chat_id)
+    mapping = STALK_LIST_CF if platform == "cf" else STALK_LIST_AC
+    mapping.setdefault(k, [])
+    if handle not in mapping[k]:
+        mapping[k].append(handle)
+        save_all()
+        return True
+    return False
+
+def remove_stalk(chat_id, platform, handle):
+    k = str(chat_id)
+    mapping = STALK_LIST_CF if platform == "cf" else STALK_LIST_AC
+    if k in mapping and handle in mapping[k]:
+        mapping[k].remove(handle)
+        save_all()
+        return True
+    return False
+
+def list_stalks(chat_id, platform):
+    k = str(chat_id)
+    mapping = STALK_LIST_CF if platform == "cf" else STALK_LIST_AC
+    return mapping.get(k, [])
+
 async def get_handle_or_ask(message: Message, platform: str):
     """
-    platform: 'cf' или 'ac'
-    Берёт ник из команды, или из /me, если нет — пишет пользователю.
+    platform: 'cf' or 'ac'
+    Try to get handle from command args or stored /me, otherwise ask user.
     """
     parts = message.text.split()
+    # If user explicitly provided a handle as first arg
     if len(parts) >= 2 and parts[1].strip():
         return parts[1].strip()
 
@@ -129,7 +175,6 @@ async def get_handle_or_ask(message: Message, platform: str):
     )
     return None
 
-
 # ---------- Фоновый сталкер ----------
 async def stalker_logic():
     global stalking_active_cf, stalking_active_ac
@@ -137,11 +182,11 @@ async def stalker_logic():
     while True:
         # CF
         if stalking_active_cf:
-            cf_chat_map = {chat: list(handles) for chat, handles in STALK_LIST_CF.items()}
+            # iterate over handles aggregated from all chats
             handle_to_chats = {}
-            for chat, handles in cf_chat_map.items():
+            for chat_str, handles in STALK_LIST_CF.items():
                 for h in handles:
-                    handle_to_chats.setdefault(h, []).append(chat)
+                    handle_to_chats.setdefault(h, []).append(chat_str)
             for handle, chats in handle_to_chats.items():
                 try:
                     logging.info(f"[CF] checking handle {handle} for {len(chats)} chats")
@@ -161,11 +206,11 @@ async def stalker_logic():
                                     f"🎯 {esc(p_id)}: {esc(p.get('name'))} (Сложность: <b>{esc(difficulty)}</b>)\n"
                                     f"🔗 <a href=\"{esc(link)}\">Перейти к задаче</a>"
                                 )
-                                for chat_id in chats:
+                                for chat_str in chats:
                                     try:
-                                        await bot.send_message(chat_id, msg, parse_mode='HTML', disable_web_page_preview=True)
+                                        await bot.send_message(int(chat_str), msg, parse_mode='HTML', disable_web_page_preview=True)
                                     except Exception:
-                                        logging.exception(f"[CF] Failed to notify chat {chat_id} for {handle}")
+                                        logging.exception(f"[CF] Failed to notify chat {chat_str} for {handle}")
                                 last_solved_cf[handle] = sub_id
                     else:
                         logging.debug(f"[CF] No new result for {handle}")
@@ -175,11 +220,10 @@ async def stalker_logic():
 
         # AC
         if stalking_active_ac:
-            ac_chat_map = {chat: list(handles) for chat, handles in STALK_LIST_AC.items()}
             handle_to_chats_ac = {}
-            for chat, handles in ac_chat_map.items():
+            for chat_str, handles in STALK_LIST_AC.items():
                 for h in handles:
-                    handle_to_chats_ac.setdefault(h, []).append(chat)
+                    handle_to_chats_ac.setdefault(h, []).append(chat_str)
             for handle, chats in handle_to_chats_ac.items():
                 try:
                     logging.info(f"[AC] checking handle {handle} for {len(chats)} chats")
@@ -199,11 +243,11 @@ async def stalker_logic():
                                     f"🎯 {esc(title)}\n"
                                     f"🔗 <a href=\"{esc(link)}\">Перейти</a>"
                                 )
-                                for chat_id in chats:
+                                for chat_str in chats:
                                     try:
-                                        await bot.send_message(chat_id, msg, parse_mode='HTML', disable_web_page_preview=True)
+                                        await bot.send_message(int(chat_str), msg, parse_mode='HTML', disable_web_page_preview=True)
                                     except Exception:
-                                        logging.exception(f"[AC] Failed to notify chat {chat_id} for {handle}")
+                                        logging.exception(f"[AC] Failed to notify chat {chat_str} for {handle}")
                                 last_solved_ac[handle] = sub_id
                     else:
                         logging.debug(f"[AC] No submissions for {handle} or API returned nothing")
@@ -214,7 +258,6 @@ async def stalker_logic():
         await asyncio.sleep(60)
 
 # ---------- Команды ----------
-
 @dp.message(Command("start"))
 async def send_welcome(message: Message):
     await message.reply("🐶 Привет! Я твоя верная собачка и слежу за твоим прогрессом!\nПиши /help.")
@@ -236,12 +279,8 @@ async def help_command(message: Message):
         "  /ac_status [ник] — статус пользователя\n"
         "  /ac_follow [ник] — следить за пользователем\n"
         "  /ac_unfollow [ник] — перестать следить\n"
-        "  /ac_list — показать список пользователей, за которыми следят\n"
-        "😈 База:\n"
+        "  /ac_list — показать список пользователей в слежке\n"
         "🐶 Если ник не указан, бот возьмёт его из /me.\n"
-        "  /start — приветствие\n"
-        "  /help — это сообщение\n"
-        "  /help_more — описание команд подробнее\n"
     )
     await message.reply(help_text, parse_mode='HTML')
 
@@ -255,16 +294,16 @@ async def help_more_command(message: Message):
         "🏆 Codeforces:\n"
         "  /cf_status [ник] — выводит рейтинг, ранг, общее количество решённых задач и распределение по сложности.\n"
         "  /cf_graph [ник] — строит график изменения рейтинга.\n"
-        "  /cf_gimme [рейтинг] [тег] — случайная задача, можно указать желаемый рейтинг и тег.\n"
+        "  /cf_gimme [ник|рейтинг] [тег] — случайная задача; можно передать ник (или оставить и использовать /me), можно указать рейтинг и тег.\n"
         "  /cf_train [ник] — генерирует тренировочный план по слабым тегам и уровню пользователя.\n"
         "  /cf_follow [ник] — добавляет пользователя в слежку.\n"
         "  /cf_unfollow [ник] — убирает пользователя из слежки.\n"
         "  /cf_list — показывает список пользователей в слежке.\n\n"
         "🎯 AtCoder:\n"
         "  /ac_status [ник] — показывает рейтинг, макс. рейтинг, количество решённых задач.\n"
-        "  /ac_graph [ник] — пока не реализован.\n"
-        "  /ac_gimme [рейтинг] — случайная задача.\n"
-        "  /ac_train [ник] — формирует тренировочный план по сложностям и не решённым задачам.\n"
+        "  /ac_graph [ник] — строит график рейтинга AC.\n"
+        "  /ac_gimme [ник|рейтинг] — случайная задача.\n"
+        "  /ac_train [ник] — формирует тренировочный план.\n"
         "  /ac_follow [ник] — добавить пользователя в слежку.\n"
         "  /ac_unfollow [ник] — убрать пользователя из слежки.\n"
         "  /ac_list — показать список пользователей в слежке.\n"
@@ -282,25 +321,17 @@ async def set_me_cmd(message: Message):
     if len(parts) >= 3 and parts[1].lower() in ("cf", "ac"):
         platform = parts[1].lower()
         nick = parts[2]
-        USER_NICKS.setdefault(uid, {"cf": None, "ac": None})[platform] = nick
+        set_user_nick(uid, platform, nick)
         await message.reply(f"✅ Установил твой {platform.upper()} ник: <b>{esc(nick)}</b>", parse_mode='HTML')
     else:
         nick = parts[1]
-        USER_NICKS.setdefault(uid, {"cf": None, "ac": None})["cf"] = nick
-        USER_NICKS.setdefault(uid, {"cf": None, "ac": None})["ac"] = nick
+        set_user_nick(uid, None, nick)
         await message.reply(f"✅ Установил твой ник для CF и AC: <b>{esc(nick)}</b>", parse_mode='HTML')
-
-    # --- Сохраняем данные в файл ---
-    save_data({
-        "USER_NICKS": USER_NICKS,
-        "STALK_LIST_CF": STALK_LIST_CF,
-        "STALK_LIST_AC": STALK_LIST_AC
-    })
 
 @dp.message(Command("me"))
 async def me_cmd(message: Message):
     uid = message.from_user.id
-    data = USER_NICKS.get(uid)
+    data = get_stored_nick_raw(uid)
     if not data:
         await message.reply("🐶 Ник не установлен. /set_me ник")
         return
@@ -340,7 +371,6 @@ async def cf_status(message: Message):
         except: await message.reply(text, parse_mode='HTML')
     else: await message.reply(text, parse_mode='HTML')
 
-
 @dp.message(Command("cf_graph"))
 async def cf_graph_cmd(message):
     handle = await get_handle_or_ask(message, "cf")
@@ -362,7 +392,7 @@ async def cf_graph_cmd(message):
     contests = [r["contestName"] for r in ratings]
 
     plt.figure(figsize=(10,5))
-    plt.plot(x, y, marker='o', color='blue')
+    plt.plot(x, y, marker='o')
     plt.title(f"CF Rating Graph — {handle}")
     plt.xlabel("Contests")
     plt.ylabel("Rating")
@@ -375,24 +405,37 @@ async def cf_graph_cmd(message):
     buf.seek(0)
     plt.close()
 
-    buf.seek(0)
     await message.answer_photo(
         BufferedInputFile(buf.getvalue(), filename="cf_graph.png"),
         caption=f"📈 График рейтинга CF — {esc(handle)}"
     )
 
-
-
-
-
-
 @dp.message(Command("cf_gimme"))
 async def cf_gimme_cmd(message: types.Message):
     parts = message.text.split()
     uid = message.from_user.id
-    handle = parts[1] if len(parts) > 1 else get_stored_nick(uid, "cf")
-    rating = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
-    tag = parts[3] if len(parts) > 3 else None
+    # determine handle / rating / tag robustly
+    handle = None
+    rating = None
+    tag = None
+    if len(parts) >= 2:
+        # if first arg is digit => treat as rating, use stored handle
+        if parts[1].isdigit():
+            rating = int(parts[1])
+            if len(parts) >= 3:
+                tag = parts[2]
+            handle = get_stored_nick(uid, "cf")
+        else:
+            # first arg could be handle
+            handle = parts[1]
+            if len(parts) >= 3 and parts[2].isdigit():
+                rating = int(parts[2])
+                if len(parts) >= 4:
+                    tag = parts[3]
+            elif len(parts) >= 3:
+                tag = parts[2]
+    else:
+        handle = get_stored_nick(uid, "cf")
 
     if not handle:
         await message.reply("🐶 Ник не указан и не найден в /me. Установи командой /set_me cf <ник>")
@@ -413,34 +456,24 @@ async def cf_gimme_cmd(message: types.Message):
                 p = sub["problem"]
                 solved_set.add(f"{p['contestId']}#{p['index']}")
 
-    # Фильтруем задачи строго по рейтингу
     candidates = []
     for p in problems:
         key = f"{p['contestId']}#{p['index']}"
         if key in solved_set:
             continue
-
-        # строго фильтруем по рейтингу
         if rating is not None:
             if p.get("rating") is None or p["rating"] != rating:
                 continue
-
-        # фильтруем по тегу
         if tag and tag not in p.get("tags", []):
             continue
-
         candidates.append(p)
-        
+
     if not candidates:
-        return await message.reply(f"🐶 Не нашлось задач с рейтингом {rating} 😢")
+        return await message.reply(f"🐶 Не нашлось задач с указанными критериями 😢")
 
     chosen = random.choice(candidates)
     link = f"https://codeforces.com/contest/{chosen['contestId']}/problem/{chosen['index']}"
     await message.reply(f"🎯 {chosen['name']} ({chosen.get('rating', '??')})\n🔗 {link}", parse_mode="HTML")
-
-
-
-
 
 # --- CF train ---
 @dp.message(Command("cf_train"))
@@ -462,7 +495,7 @@ async def cf_train_cmd(message: Message):
                 key = f"{p.get('contestId')}#{p.get('index')}"
                 solved.add(key)
                 for t in p.get("tags",[]): tag_counts[t] = tag_counts.get(t,0)+1
-    weak_tags = sorted(tag_counts,key=lambda x:tag_counts[x])[:3] if tag_counts else ["implementation","math","greedy"]
+    weak_tags = sorted(tag_counts, key=lambda x:tag_counts[x])[:3] if tag_counts else ["implementation","math","greedy"]
     url_ps = "https://codeforces.com/api/problemset.problems"
     ps = await safe_get_json(url_ps)
     all_probs = []
@@ -484,6 +517,8 @@ async def cf_train_cmd(message: Message):
         selected_by_level.append((level_name,level_tasks))
     text_lines=[f"🏋️ Тренировочный марафон для {esc(handle)}",f"🎯 Твои цели: {', '.join(weak_tags)}\n"]
     for level_name,tasks in selected_by_level:
+        if not tasks:
+            continue
         text_lines.append(f"{level_name} ({tasks[0][1].get('rating','?')}):")
         for tag,p in tasks:
             t=tag or "any"
@@ -496,45 +531,37 @@ async def cf_train_cmd(message: Message):
 async def cf_follow_cmd(message: Message):
     handle = await get_handle_or_ask(message,"cf")
     if not handle: return
-    chat_id=message.chat.id
-    STALK_LIST_CF.setdefault(chat_id,[])
-    if handle not in STALK_LIST_CF[chat_id]:
-        STALK_LIST_CF[chat_id].append(handle)
-        await message.reply(f"✅ Слежу за <b>{esc(handle)}</b> на CF!",parse_mode='HTML')
-    else: await message.reply("🐶 Уже в списке.")
-
-    STALK_LIST_CF.setdefault(chat_id, [])
-    if handle not in STALK_LIST_CF[chat_id]:
-        STALK_LIST_CF[chat_id].append(handle)
-        save_data({"USER_NICKS": USER_NICKS, "STALK_LIST_CF": STALK_LIST_CF, "STALK_LIST_AC": STALK_LIST_AC})
+    chat_id = message.chat.id
+    added = add_stalk(chat_id, "cf", handle)
+    if added:
+        await message.reply(f"✅ Слежу за <b>{esc(handle)}</b> на CF!", parse_mode='HTML')
+    else:
+        await message.reply("🐶 Уже в списке.")
 
 @dp.message(Command("cf_unfollow"))
 async def cf_unfollow_cmd(message: Message):
     handle = await get_handle_or_ask(message,"cf")
     if not handle: return
-    chat_id=message.chat.id
-    if chat_id in STALK_LIST_CF and handle in STALK_LIST_CF[chat_id]:
-        STALK_LIST_CF[chat_id].remove(handle)
-        await message.reply(f"✅ Убрал <b>{esc(handle)}</b> из CF-списка.",parse_mode='HTML')
-    else: await message.reply("🐶 Его и так нет в списке.")
-
-    STALK_LIST_CF.setdefault(chat_id, [])
-    if handle not in STALK_LIST_CF[chat_id]:
-        STALK_LIST_CF[chat_id].append(handle)
-        save_data({"USER_NICKS": USER_NICKS, "STALK_LIST_CF": STALK_LIST_CF, "STALK_LIST_AC": STALK_LIST_AC})
+    chat_id = message.chat.id
+    removed = remove_stalk(chat_id, "cf", handle)
+    if removed:
+        await message.reply(f"✅ Убрал <b>{esc(handle)}</b> из CF-списка.", parse_mode='HTML')
+    else:
+        await message.reply("🐶 Его и так нет в списке.")
 
 @dp.message(Command("cf_list"))
 async def cf_list_cmd(message: Message):
-    handles=STALK_LIST_CF.get(message.chat.id,[])
-    if not handles: return await message.reply("🐶 CF список пуст.")
-    await message.reply("🕵️ <b>CF список:</b>\n"+"\n".join(f"• {esc(h)}" for h in handles),parse_mode='HTML')
+    handles = list_stalks(message.chat.id, "cf")
+    if not handles:
+        return await message.reply("🐶 CF список пуст.")
+    await message.reply("🕵️ <b>CF список:</b>\n" + "\n".join(f"• {esc(h)}" for h in handles), parse_mode='HTML')
 
 # --- AC команды ---
 @dp.message(Command("ac_status"))
 async def ac_status(message: Message):
     handle = await get_handle_or_ask(message,"ac")
     if not handle: return
-    await message.reply(f"🐶 Смотрю статистику {esc(handle)}...",parse_mode='HTML')
+    await message.reply(f"🐶 Смотрю статистику {esc(handle)}...", parse_mode='HTML')
     url_info=f"https://kenkoooo.com/atcoder/atcoder-api/v3/user/info?user={handle}"
     info=await safe_get_json(url_info)
     if not info: return await message.reply("❌ Не могу получить данные AC.")
@@ -544,7 +571,6 @@ async def ac_status(message: Message):
     url_subs=f"https://kenkoooo.com/atcoder/atcoder-api/v3/user/submissions?user={handle}"
     subs=await safe_get_json(url_subs)
     solved_count=0
-    difficulty_stats={}
     if subs:
         for sub in subs:
             if sub.get("result")=="AC": solved_count+=1
@@ -558,53 +584,61 @@ async def ac_status(message: Message):
 async def ac_gimme_cmd(message: types.Message):
     parts = message.text.split()
     uid = message.from_user.id
-    handle = parts[1] if len(parts) > 1 else get_stored_nick(uid, "ac")
-    rating = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+    handle = None
+    rating = None
+
+    if len(parts) >= 2:
+        if parts[1].isdigit():
+            rating = int(parts[1])
+            handle = get_stored_nick(uid, "ac")
+        else:
+            handle = parts[1]
+            if len(parts) >= 3 and parts[2].isdigit():
+                rating = int(parts[2])
+    else:
+        handle = get_stored_nick(uid, "ac")
 
     if not handle:
         await message.reply("🐶 Ник не указан и не найден в /me. Установи командой /set_me ac <ник>")
         return
 
-    # Получаем список задач AC
-    data = await safe_get_json("https://atcoder.jp/contests/all/tasks.json")  # пример ссылки
+    data = await safe_get_json("https://kenkoooo.com/atcoder/atcoder-api/v3/problems")
     if not data:
         return await message.reply("❌ Не могу получить задачи AC.")
 
-    problems = data  # Тут структура зависит от AC API
-    solved_set = set()  # Если есть API для решённых, можно заполнить
+    problems = data  # here it's already a list of problems from API
+    solved_set = set()
+    # If we had user's submissions, we could fill solved_set (skipped for brevity)
 
-    # Фильтруем задачи
     candidates = []
     for p in problems:
-        key = p["id"]
-        if key in solved_set:
+        pid = p.get("id") or p.get("task_id") or p.get("problem_id")
+        if pid in solved_set:
             continue
-        if rating and "difficulty" in p and abs(p["difficulty"] - rating) > 50:
-            continue
+        if rating and p.get("difficulty"):
+            try:
+                if abs(int(p["difficulty"]) - rating) > 50:
+                    continue
+            except Exception:
+                pass
         candidates.append(p)
 
     if not candidates:
         return await message.reply("🐶 Не нашлось подходящих задач 😢")
 
     chosen = random.choice(candidates)
-    link = f"https://atcoder.jp/contests/{chosen['contest_id']}/tasks/{chosen['id']}"
-    await message.reply(f"🎯 {chosen['name']}({chosen.get('difficulty', '??')})\n🔗 {link}", parse_mode="HTML")
-
+    contest_id = chosen.get("contest_id") or chosen.get("contest")
+    pid = chosen.get("id") or chosen.get("task_id") or chosen.get("problem_id")
+    link = f"https://atcoder.jp/contests/{contest_id}/tasks/{pid}" if contest_id else f"https://atcoder.jp/tasks/{pid}"
+    await message.reply(f"🎯 {chosen.get('title', chosen.get('name','Unknown'))}({chosen.get('difficulty', '??')})\n🔗 {link}", parse_mode="HTML")
 
 @dp.message(Command("ac_follow"))
 async def ac_follow_cmd(message: Message):
     handle = await get_handle_or_ask(message, "ac")
     if not handle: return
-    chat_id = message.chat.id
-    STALK_LIST_AC.setdefault(chat_id, [])
-    if handle not in STALK_LIST_AC[chat_id]:
-        STALK_LIST_AC[chat_id].append(handle)
+    added = add_stalk(message.chat.id, "ac", handle)
+    if added:
         await message.reply(f"✅ Слежу за <b>{esc(handle)}</b> на AC!", parse_mode='HTML')
-        save_data({
-            "USER_NICKS": USER_NICKS,
-            "STALK_LIST_CF": STALK_LIST_CF,
-            "STALK_LIST_AC": STALK_LIST_AC
-        })
     else:
         await message.reply("🐶 Уже в списке.")
 
@@ -612,25 +646,18 @@ async def ac_follow_cmd(message: Message):
 async def ac_unfollow_cmd(message: Message):
     handle = await get_handle_or_ask(message, "ac")
     if not handle: return
-    chat_id = message.chat.id
-    if chat_id in STALK_LIST_AC and handle in STALK_LIST_AC[chat_id]:
-        STALK_LIST_AC[chat_id].remove(handle)
+    removed = remove_stalk(message.chat.id, "ac", handle)
+    if removed:
         await message.reply(f"✅ Убрал <b>{esc(handle)}</b> из AC-списка.", parse_mode='HTML')
-        save_data({
-            "USER_NICKS": USER_NICKS,
-            "STALK_LIST_CF": STALK_LIST_CF,
-            "STALK_LIST_AC": STALK_LIST_AC
-        })
     else:
         await message.reply("🐶 Его и так нет в списке.")
 
-
 @dp.message(Command("ac_list"))
 async def ac_list_cmd(message: Message):
-    handles=STALK_LIST_AC.get(message.chat.id,[])
-    if not handles: return await message.reply("🐶 AC список пуст.")
-    await message.reply("🕵️ <b>AC список:</b>\n"+"\n".join(f"• {esc(h)}" for h in handles),parse_mode='HTML')
-
+    handles=list_stalks(message.chat.id, "ac")
+    if not handles:
+        return await message.reply("🐶 AC список пуст.")
+    await message.reply("🕵️ <b>AC список:</b>\n" + "\n".join(f"• {esc(h)}" for h in handles), parse_mode='HTML')
 
 @dp.message(Command("ac_graph"))
 async def ac_graph_cmd(message):
@@ -644,10 +671,10 @@ async def ac_graph_cmd(message):
         return
 
     x = [datetime.fromtimestamp(r["epoch_second"]) for r in res]
-    y = [r["new_rating"] for r in res]
+    y = [r.get("new_rating") or r.get("rating") for r in res]
 
     plt.figure(figsize=(10,5))
-    plt.plot(x, y, marker='o', color='green')
+    plt.plot(x, y, marker='o')
     plt.title(f"AC Rating Graph — {handle}")
     plt.xlabel("Дата")
     plt.ylabel("Rating")
@@ -660,10 +687,9 @@ async def ac_graph_cmd(message):
     buf.seek(0)
     plt.close()
 
-    buf.seek(0)
     await message.answer_photo(
-        BufferedInputFile(buf.getvalue(), filename="cf_graph.png"),
-        caption=f"📈 График рейтинга CF — {esc(handle)}"
+        BufferedInputFile(buf.getvalue(), filename="ac_graph.png"),
+        caption=f"📈 График рейтинга AC — {esc(handle)}"
     )
 
 # --- AC train ---
@@ -675,14 +701,12 @@ async def ac_train_cmd(message: Message):
 
     await message.reply(f"🐶 Анализирую {esc(handle)}...", parse_mode='HTML')
 
-    # Берём все задачи
     url_problems = "https://kenkoooo.com/atcoder/atcoder-api/v3/problems"
     problems = await safe_get_json(url_problems)
     if not problems:
         await message.reply("❌ Не могу получить список задач AC.")
         return
 
-    # Берём все успешные сабмиссии пользователя
     url_subs = f"https://kenkoooo.com/atcoder/atcoder-api/v3/user/submissions?user={handle}"
     subs = await safe_get_json(url_subs)
     solved = set()
@@ -691,8 +715,6 @@ async def ac_train_cmd(message: Message):
             if sub.get("result") == "AC":
                 solved.add(sub.get("problem_id"))
 
-    # Разделяем задачи по уровню сложности
-    # Берём средний рейтинг пользователя
     url_info = f"https://kenkoooo.com/atcoder/atcoder-api/v3/user/info?user={handle}"
     info = await safe_get_json(url_info)
     rating = info.get("rating", 0) if info else 0
@@ -702,10 +724,9 @@ async def ac_train_cmd(message: Message):
 
     for level_name, lvl_rating in levels:
         level_tasks = []
-        # Выбираем 3 случайные задачи для уровня
-        candidates = [p for p in problems if p.get("difficulty") and abs(int(p["difficulty"]) - lvl_rating) <= 100 and p["id"] not in solved]
+        candidates = [p for p in problems if p.get("difficulty") and p.get("id") not in solved and abs(int(p["difficulty"]) - lvl_rating) <= 100] if problems else []
         if not candidates:
-            candidates = [p for p in problems if p.get("difficulty") and p["id"] not in solved]
+            candidates = [p for p in problems if p.get("difficulty") and p.get("id") not in solved]
         for _ in range(3):
             if candidates:
                 chosen = random.choice(candidates)
@@ -713,7 +734,6 @@ async def ac_train_cmd(message: Message):
                 level_tasks.append(chosen)
         selected_by_level.append((level_name, level_tasks))
 
-    # Формируем текст для ответа
     text_lines = [f"🏋️ Тренировочный марафон для {esc(handle)}\n🎯 Цель: развивать навыки и решать задачи\n"]
     for level_name, tasks in selected_by_level:
         if not tasks:
@@ -728,8 +748,7 @@ async def ac_train_cmd(message: Message):
 
     await message.reply("\n".join(text_lines), parse_mode='HTML', disable_web_page_preview=True)
 
-
-
+# --- Stalk toggles ---
 @dp.message(Command("cf_stalk_on"))
 async def cf_stalk_on_cmd(message: Message):
     global stalking_active_cf
@@ -754,13 +773,18 @@ async def ac_stalk_off_cmd(message: Message):
     stalking_active_ac = False
     await message.reply("⚠️ Уведомления AC отключены.", parse_mode='HTML')
 
-
 # ---------- Main ----------
 async def main():
     await start_global_session()
-    asyncio.create_task(stalker_logic())
-    await dp.start_polling(bot)
+    stalker_task = asyncio.create_task(stalker_logic())
+    try:
+        await dp.start_polling(bot)
+    finally:
+        stalker_task.cancel()
+        await close_global_session()
 
 if __name__ == "__main__":
-    try: asyncio.run(main())
-    finally: asyncio.run(close_global_session())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("Shutdown by user")
